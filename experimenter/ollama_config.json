@@ -1,0 +1,7 @@
+{
+    "base_url": "http://localhost:11434",
+    "model": "llama3.1",
+    "temperature": 0.4,
+    "timeout": 600,
+    "num_ctx": 32768
+}
