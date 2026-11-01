@@ -6,6 +6,9 @@ Run:
 
 The experiment auto-saves after every iteration.  Kill it at any time with
 Ctrl-C; re-running the script will resume from where it left off.
+
+Change `model` to a model you actually have pulled — `ollama pull llama3.1`,
+then `ollama list` to see the available names.
 """
 
 from experimenter import Experiment, OllamaConfig
@@ -22,7 +25,7 @@ exp = Experiment(
     max_time_seconds=3600,
     ollama_config=OllamaConfig(
         base_url="http://localhost:11434",
-        model="hf.co/unsloth/gpt-oss-20b-GGUF:UD-Q6_K_XL",
+        model="llama3.1",          # ← change this to a model you have pulled
         temperature=0.4,
     ),
     verbose=True,

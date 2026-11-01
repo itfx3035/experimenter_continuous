@@ -15,14 +15,13 @@ generated lazily before the first execution and refreshed whenever execution
 fails unexpectedly.
 """
 
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass
 
 
 @dataclass
 class Criteria:
     task_description: str
-    success_indicators: List[str]
+    success_indicators: list[str]
     evaluation_rubric: str
     requires_execution: bool
     # Populated lazily; empty string means "not yet generated".
@@ -47,13 +46,22 @@ class Criteria:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Criteria":
+        """Tolerant: state.json written by an older version may miss keys or
+        store numbers as strings, and a resume should not crash on that."""
+        indicators = d.get("success_indicators") or []
+        if not isinstance(indicators, list):
+            indicators = [str(indicators)]
+        try:
+            speedup = float(d.get("speedup_target", 0.0))
+        except (TypeError, ValueError):
+            speedup = 0.0
         return cls(
-            task_description=d["task_description"],
-            success_indicators=d["success_indicators"],
-            evaluation_rubric=d["evaluation_rubric"],
-            requires_execution=bool(d["requires_execution"]),
-            execution_harness=d.get("execution_harness", ""),
-            speedup_target=float(d.get("speedup_target", 0.0)),
+            task_description=str(d.get("task_description", "")),
+            success_indicators=[str(s) for s in indicators],
+            evaluation_rubric=str(d.get("evaluation_rubric", "")),
+            requires_execution=bool(d.get("requires_execution", False)),
+            execution_harness=str(d.get("execution_harness", "")),
+            speedup_target=speedup,
         )
 
     def format_for_llm(self) -> str:

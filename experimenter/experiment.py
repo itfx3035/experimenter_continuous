@@ -6,13 +6,17 @@ Public API
     exp = Experiment(
         name="fast_fibonacci",
         prompt="Optimize fibonacci(n) for speed. n can be up to 35.",
+        requires_execution=True,
         ollama_config=OllamaConfig(model="llama3.1"),
     )
-    result = exp.run()
+    result = exp.run(initial="def fibonacci(n): ...")
 
-    # Resume later
-    exp2 = Experiment(name="fast_fibonacci", prompt="...")
+    # Resume later (same name + storage_dir detects existing state)
+    exp2 = Experiment(name="fast_fibonacci", prompt="...", requires_execution=True)
     result = exp2.run()   # detects existing state and resumes automatically
+
+    exp2.stop()    # graceful stop after the current iteration
+    exp2.get_status()
 
 Loop steps per iteration
 ------------------------
@@ -23,6 +27,15 @@ Loop steps per iteration
   5. EVALUATE          — LLM scores result 0.0–1.0 against criteria.
   6. STORE             — everything persisted atomically.
   7. COMPRESS          — if context budget is exceeded, old history is summarised.
+
+Notes
+-----
+- A lock file (storage/lock) prevents two processes from writing the same
+  experiment directory; a stale lock from a dead pid is taken over.
+- Signal handlers are installed only from the main thread; the first Ctrl-C
+  means "save and stop", the second aborts immediately.
+- Stagnation count is persisted in state.json, so a resumed run keeps the
+  "this strategy has not improved for N iterations" warning.
 """
 
 from __future__ import annotations
@@ -31,9 +44,8 @@ import ast
 import logging
 import signal
 import time
-from typing import Dict, List, Optional
 
-from .config import ExperimentConfig, OllamaConfig
+from .config import ExecutorConfig, ExperimentConfig, MemoryConfig, OllamaConfig
 from .criteria import Criteria
 from .executor import ExecutionResult, SubprocessExecutor
 from .iteration import ExperimentState, Iteration
@@ -56,7 +68,10 @@ class Experiment:
         max_time_seconds: float = 7200.0,
         storage_dir: str = "./experiments",
         verbose: bool = True,
-        ollama_config: Optional[OllamaConfig] = None,
+        ollama_config: OllamaConfig | None = None,
+        memory_config: MemoryConfig | None = None,
+        executor_config: ExecutorConfig | None = None,
+        use_lock: bool = True,
     ) -> None:
         # Use JSON configuration if no explicit config is provided
         if ollama_config is None:
@@ -71,29 +86,57 @@ class Experiment:
             storage_dir=storage_dir,
             verbose=verbose,
             ollama_config=ollama_config,
+            memory=memory_config or MemoryConfig(),
+            executor=executor_config or ExecutorConfig(),
         )
         self._storage = Storage(storage_dir, name)
+        self._use_lock = use_lock
         setup_logging(self._storage.base)
-        self._llm = LLMClient(self._config.ollama_config)
-        self._executor = SubprocessExecutor(tmp_dir=str(self._storage.tmp_dir))
-        self._memory = MemoryManager(self._storage, self._llm)
+        # LLMClient and MemoryManager share the same MemoryConfig so the fit and
+        # the compression decision use the same effective budget.
+        self._llm = LLMClient(self._config.ollama_config, self._config.memory)
+        self._executor = SubprocessExecutor(
+            tmp_dir=str(self._storage.tmp_dir), config=self._config.executor
+        )
+        # Budget derived from the model's actual context window, not a constant.
+        self._memory = MemoryManager(
+            self._storage,
+            self._llm,
+            memory_config=self._config.memory,
+            token_budget=self._config.context_budget(),
+        )
 
-        self._state: Optional[ExperimentState] = None
-        self._criteria: Optional[Criteria] = None
+        self._state: ExperimentState | None = None
+        self._criteria: Criteria | None = None
         # Current best implementation/content text (seeded from initial or restored).
         self._current: str = ""
 
         self._stop_requested = False
         self._pause_requested = False
+        self._signal_count = 0
 
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        # signal.signal() only works from the main thread.  Guard so the library
+        # can also be used inside threads / async apps instead of crashing.
+        try:
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+        except ValueError:
+            logger.warning(
+                "Signal handlers not installed (Experiment created outside the "
+                "main thread); use exp.stop() to request a graceful stop."
+            )
 
     # ------------------------------------------------------------------ #
     #  Signal handling
     # ------------------------------------------------------------------ #
 
     def _handle_signal(self, _signum: int, _frame: object) -> None:
+        self._signal_count += 1
+        if self._signal_count >= 2:
+            # Second interrupt: abort immediately (state is still saved by
+            # _run_loop's finally block).
+            self._log("Second interrupt — aborting immediately.")
+            raise KeyboardInterrupt
         self._log("Interrupt received — will stop after this iteration.")
         self._stop_requested = True
 
@@ -101,23 +144,45 @@ class Experiment:
     #  Public API
     # ------------------------------------------------------------------ #
 
-    def run(self) -> Dict:
+    def run(self, initial: str = "") -> dict:
         """
         Start a new experiment, or resume an existing one automatically.
 
-        If no saved state exists, the LLM generates the initial implementation
-        or content from the prompt before the first iteration.
+        `initial` seeds the baseline for a brand-new experiment.  If it is empty
+        (or the experiment already exists), the LLM generates the baseline from
+        the prompt.
         """
         if self._storage.exists():
             self._log("Existing experiment found — resuming.")
-            return self._resume()
-        return self._start()
+            return self._with_lock(self._resume)
+        return self._with_lock(lambda: self._start(initial))
 
-    def resume(self) -> Dict:
-        """Resume a previously saved experiment (raises if none exists)."""
+    def resume(self) -> dict:
+        """
+        Resume a previously saved experiment.
+
+        Raises RuntimeError if no saved state exists, and ValueError if
+        state.json exists but is corrupt (Storage.load_state).
+        """
         if not self._storage.exists():
             raise RuntimeError(f"No saved experiment '{self._config.name}' found.")
-        return self._resume()
+        return self._with_lock(self._resume)
+
+    def _with_lock(self, fn) -> dict:
+        """Guard the run so two processes cannot write the same experiment."""
+        if not self._use_lock:
+            return fn()
+        if not self._storage.acquire_lock():
+            holder = self._storage.held_by_other()
+            raise RuntimeError(
+                f"Experiment '{self._config.name}' is already running in process "
+                f"{holder}; two runs sharing {self._storage.base} would corrupt it. "
+                "Pass use_lock=False to override."
+            )
+        try:
+            return fn()
+        finally:
+            self._storage.release_lock()
 
     def stop(self) -> None:
         """Request a graceful stop after the current iteration."""
@@ -127,7 +192,7 @@ class Experiment:
         """Request a pause after the current iteration."""
         self._pause_requested = True
 
-    def get_status(self) -> Dict:
+    def get_status(self) -> dict:
         if self._state is None:
             return {"status": "not_started"}
         return {
@@ -141,7 +206,7 @@ class Experiment:
     #  Internals — startup / resume
     # ------------------------------------------------------------------ #
 
-    def _start(self) -> Dict:
+    def _start(self, initial: str = "") -> dict:
         self._log("Generating success criteria from your prompt…")
         self._criteria = self._llm.generate_criteria(
             self._config.prompt, self._config.requires_execution
@@ -150,7 +215,20 @@ class Experiment:
         self._log(f"Requires execution: {self._criteria.requires_execution}")
 
         self._log("Generating initial baseline…")
-        self._current = self._llm.generate_initial(self._criteria)
+        if initial.strip():
+            self._current = initial.strip()
+            if self._criteria.requires_execution:
+                try:
+                    ast.parse(self._current)
+                except SyntaxError as exc:
+                    self._log(
+                        f"  Seed `initial` is not valid Python ({exc}) — "
+                        "generating a baseline instead."
+                    )
+                    self._current = self._llm.generate_initial(self._criteria)
+        else:
+            self._current = self._llm.generate_initial(self._criteria)
+        self._storage.save_artifact("best_result.txt", self._current)
 
         if self._criteria.requires_execution:
             self._criteria.execution_harness = self._generate_harness_with_smoketest(
@@ -168,7 +246,7 @@ class Experiment:
         self._save_state()
         return self._run_loop()
 
-    def _resume(self) -> Dict:
+    def _resume(self) -> dict:
         state = self._storage.load_state()
         if state is None:
             raise RuntimeError("state.json is missing or corrupt — cannot resume.")
@@ -178,13 +256,21 @@ class Experiment:
             self._criteria = Criteria.from_dict(self._state.criteria)
         else:
             self._log("No saved criteria — regenerating from prompt…")
-            self._criteria = self._llm.generate_criteria(self._config.prompt)
+            # requires_execution is a user choice, not an LLM guess — it must be
+            # passed here or this call raises TypeError.
+            self._criteria = self._llm.generate_criteria(
+                self._config.prompt, self._config.requires_execution
+            )
             self._state.criteria = self._criteria.to_dict()
 
         self._memory.load()
+        # Prefer the persisted artifact: after compression the global best may no
+        # longer be in memory.jsonl, so best() could report a worse iteration
+        # than state.best_score.
         best = self._memory.best()
-        self._current = best.implementation if best else ""
-
+        self._current = self._storage.load_artifact("best_result.txt") or (
+            best.implementation if best else ""
+        )
         if not self._current:
             self._log("No prior implementation found — regenerating initial baseline…")
             self._current = self._llm.generate_initial(self._criteria)
@@ -199,48 +285,60 @@ class Experiment:
     #  Main loop
     # ------------------------------------------------------------------ #
 
-    def _run_loop(self) -> Dict:
+    def _run_loop(self) -> dict:
         assert self._state is not None  # always set by _start/_resume
 
         self._state.status = "running"
         self._save_state()
         loop_start = time.time()
-        stagnation_count = 0   # consecutive iterations without score improvement
+        # Persisted across resumes: a resumed run should still know it has been
+        # plateauing, otherwise the stagnation warning resets to zero.
+        stagnation_count = self._state.stagnation_count
 
-        while True:
-            if self._stop_requested:
-                self._state.status = "stopped"
-                break
-            if self._pause_requested:
-                self._state.status = "paused"
-                self._pause_requested = False
-                break
-            if self._state.current_iteration >= self._config.max_iterations:
-                self._state.status = "completed"
-                break
-            elapsed = self._state.total_elapsed_seconds + (time.time() - loop_start)
-            if elapsed >= self._config.max_time_seconds:
-                self._state.status = "completed"
-                break
+        try:
+            while True:
+                if self._stop_requested:
+                    self._state.status = "stopped"
+                    break
+                if self._pause_requested:
+                    self._state.status = "paused"
+                    self._pause_requested = False
+                    break
+                if self._state.current_iteration >= self._config.max_iterations:
+                    self._state.status = "completed"
+                    break
+                elapsed = self._state.total_elapsed_seconds + (time.time() - loop_start)
+                if elapsed >= self._config.max_time_seconds:
+                    # A time-limited run is not the same as hitting the target.
+                    self._state.status = "time_exhausted"
+                    break
 
-            prev_best = self._state.best_score
-            self._state.current_iteration += 1
-            n = self._state.current_iteration
-            self._log(f"--- Iteration {n} / {self._config.max_iterations} ---")
+                prev_best = self._state.best_score
+                self._state.current_iteration += 1
+                n = self._state.current_iteration
+                self._log(f"--- Iteration {n} / {self._config.max_iterations} ---")
 
-            try:
-                self._run_iteration(n, stagnation_count)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Unhandled error in iteration %d", n)
-                self._log(f"Iteration {n} failed with error: {exc}  (continuing)")
+                try:
+                    self._run_iteration(n, stagnation_count)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Unhandled error in iteration %d", n)
+                    self._log(f"Iteration {n} failed with error: {exc}  (continuing)")
 
-            if self._state.best_score > prev_best + 0.02:
-                stagnation_count = 0
-            else:
-                stagnation_count += 1
-
-        self._state.total_elapsed_seconds += time.time() - loop_start
-        self._save_state()
+                if self._state.best_score > prev_best + self._config.stagnation_threshold:
+                    stagnation_count = 0
+                else:
+                    stagnation_count += 1
+                self._state.stagnation_count = stagnation_count
+        except KeyboardInterrupt:
+            # Second Ctrl-C: save what we have, then let the caller see the interrupt.
+            self._state.status = "stopped"
+            self._log("Interrupted — saving state before exiting.")
+            raise
+        finally:
+            self._state.total_elapsed_seconds += time.time() - loop_start
+            self._save_state()
 
         self._log(
             f"Experiment {self._state.status}. "
@@ -279,9 +377,17 @@ class Experiment:
         # --- 2. IMPLEMENT (with syntax retry for code tasks) ---
         impl = self._implement_with_retry(proposal, context, avoid=avoid)
         if impl is None:
-            msg = "  Implementation failed after all retries — skipping this iteration."
+            # Record the failure: without an Iteration the proposal never enters
+            # past_proposals(), so the LLM can loop on the same failing idea.
+            msg = "  Implementation failed after all retries — recording and skipping."
             self._log(msg)
             logger.warning(msg)
+            iteration.evaluation_score = 0.0
+            iteration.evaluation_reasoning = (
+                "Implementation failed after all retries (LLM error or syntax error)."
+            )
+            self._memory.add(iteration)
+            self._save_state()
             return
         iteration.implementation = impl
 
@@ -384,8 +490,8 @@ class Experiment:
 
     def _implement_with_retry(
         self, proposal: str, context: str, max_retries: int = 3,
-        avoid: Optional[List[str]] = None,
-    ) -> Optional[str]:
+        avoid: list[str] | None = None,
+    ) -> str | None:
         """
         Ask the LLM to implement the proposal.  For code tasks, verify syntax
         and retry with the error message if it fails.  Transient LLM errors
@@ -545,6 +651,6 @@ class Experiment:
 
     def _log(self, msg: str) -> None:
         if self._config.verbose:
-            print(f"[Experimeter] {msg}")
-        # logger is experimeter.experiment → writes to experiment.log
+            print(f"[Experimenter] {msg}")
+        # logger is experimenter.experiment → via the package logger to experiment.log
         logger.info(msg)

@@ -8,28 +8,31 @@ Design decisions
   exit (fixed from original: daemon=True).
 - A single 0.0–1.0 evaluation scale throughout (original had two competing
   scales that caused confusion).
-- JSON parsing is tolerant: _extract_json() finds the first {...} block in
-  the LLM output regardless of surrounding prose or markdown fences.
+- JSON parsing is tolerant: parsing.extract_json() finds the first {...} block in
+  the LLM output regardless of surrounding prose or markdown fences (it lives in
+  parsing.py so it can be unit-tested without langchain installed).
 - Code extraction strips ``` fences but otherwise returns the text verbatim so
   the caller can perform its own syntax check before using it.
+- _fit_context() returns the truncated message that is actually sent.  The old
+  _check_context_length() mutated a local parameter, so its truncation was a
+  no-op and oversized prompts were sent to the model unchanged.
 - No module-level TimeoutError redefinition; we use the Python built-in.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 import threading
 import time
-from typing import Callable, List, Optional, Tuple
+from collections.abc import Callable
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 
-from .config import OllamaConfig, CONTEXT_SAFETY_MARGIN
+from .config import TOKEN_CHAR_FACTOR, MemoryConfig, OllamaConfig
 from .criteria import Criteria
 from .iteration import CompressedMemory
+from .parsing import extract_code, extract_json, fit_to_budget
 
 logger = logging.getLogger(__name__)
 
@@ -45,58 +48,22 @@ _SYSTEM_RESEARCHER = (
 # ------------------------------------------------------------------ #
 
 def _extract_json(text: str) -> dict:
-    """
-    Return the first complete JSON object found in text.
-    Handles markdown code fences and leading/trailing prose.
-    """
-    # Strip markdown fences
-    text = re.sub(r"```(?:json)?\s*", "", text)
-    text = re.sub(r"```", "", text)
-
-    start = text.find("{")
-    if start == -1:
-        raise ValueError(f"No JSON object found in LLM response. Response head: {text[:300]!r}")
-
-    depth = 0
-    in_string = False
-    escape_next = False
-    for idx, ch in enumerate(text[start:], start):
-        if escape_next:
-            escape_next = False
-            continue
-        if ch == "\\" and in_string:
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start : idx + 1])
-
-    raise ValueError(f"Unclosed JSON object in LLM response. Text from opening brace: {text[start:start+300]!r}")
+    """Alias for parsing.extract_json (kept for existing call sites)."""
+    return extract_json(text)
 
 
 def _extract_code(text: str) -> str:
-    """Return code inside the first ```python or ``` fence, or the full text."""
-    match = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return text.strip()
+    """Alias for parsing.extract_code (kept for existing call sites)."""
+    return extract_code(text)
 
 
 # ------------------------------------------------------------------ #
 #  Response validators
 # ------------------------------------------------------------------ #
 
-def _validate_json_keys(*required_keys: str) -> Callable[[str], Optional[str]]:
+def _validate_json_keys(*required_keys: str) -> Callable[[str], str | None]:
     """Return a validator that checks the response is valid JSON with the given keys."""
-    def _validate(text: str) -> Optional[str]:
+    def _validate(text: str) -> str | None:
         try:
             data = _extract_json(text)
         except ValueError as exc:
@@ -108,14 +75,19 @@ def _validate_json_keys(*required_keys: str) -> Callable[[str], Optional[str]]:
     return _validate
 
 
-def _validate_non_empty_code(text: str) -> Optional[str]:
-    """Return an error string if the response contains no extractable code."""
+def _validate_non_empty_code(text: str) -> str | None:
+    """Return an error string if the response has no extractable content.
+
+    Deliberately lenient: `_extract_code` falls back to the raw text when the
+    model omits fences, so only an empty response is rejected here — real
+    syntax checking happens in Experiment._implement_with_retry.
+    """
     if not _extract_code(text):
         return "Response must contain non-empty code inside a ```python ... ``` fence"
     return None
 
 
-def _validate_evaluate_response(text: str) -> Optional[str]:
+def _validate_evaluate_response(text: str) -> str | None:
     """Validate that the evaluate response has a score in [0.0, 1.0]."""
     try:
         data = _extract_json(text)
@@ -137,9 +109,14 @@ def _validate_evaluate_response(text: str) -> Optional[str]:
 # ------------------------------------------------------------------ #
 
 class LLMClient:
-    def __init__(self, config: OllamaConfig) -> None:
+    def __init__(
+        self, config: OllamaConfig, memory_config: MemoryConfig | None = None
+    ) -> None:
         self._config = config
-        self._llm: Optional[ChatOllama] = None
+        # Same knobs MemoryManager uses, so the fit here and the compression
+        # decision there agree on what "fits in the window" means.
+        self._mem_cfg = memory_config or MemoryConfig()
+        self._llm: ChatOllama | None = None
 
     @property
     def llm(self) -> ChatOllama:
@@ -162,7 +139,7 @@ class LLMClient:
         user: str,
         max_retries: int = 3,
         label: str = "",
-        validate: Optional[Callable[[str], Optional[str]]] = None,
+        validate: Callable[[str], str | None] | None = None,
     ) -> str:
         """
         Call the LLM with exponential-backoff retry and optional content validation.
@@ -175,9 +152,10 @@ class LLMClient:
             it is invalid.  On failure the LLM is re-prompted with a correction
             hint appended to the user message.
         """
-        # Pre-call validation: check context fits within model's window
-        self._check_context_length(system, user, label)
-        
+        # Pre-call validation: check the context fits the model's window AND use
+        # the (possibly truncated) message that will actually be sent.
+        user = self._fit_context(system, user, label)
+
         label_str = label or "llm"
         last_error: Exception = RuntimeError("no attempts made")
         current_user = user
@@ -238,43 +216,37 @@ class LLMClient:
 
         raise RuntimeError(f"LLM failed after {max_retries} attempts: {last_error}") from last_error
 
-    def _check_context_length(self, system: str, user: str, label: str) -> None:
+    def _fit_context(self, system: str, user: str, label: str) -> str:
         """
-        Validate that the combined context fits within the model's context window.
-        
-        Raises ValueError if the context exceeds the safety limit.
-        """
-        total_chars = len(system) + len(user)
-        # Rough estimate: 1 token ≈ 4 characters
-        max_chars = self._config.num_ctx * 4
-        # Apply safety margin to leave room for response and tokenization variance
-        safety_limit = int(max_chars * CONTEXT_SAFETY_MARGIN)
-        
-        if total_chars > safety_limit:
-            # Estimate tokens for logging
-            estimated_tokens = total_chars // 4
-            logger.error(
-                "Context size (%d chars, ~%d tokens) exceeds safety limit "
-                "(%d chars, model num_ctx=%d) for %s call",
-                total_chars, estimated_tokens, safety_limit,
-                self._config.num_ctx, label
-            )
-            # Truncate user message as last-ditch effort
-            excess_chars = total_chars - safety_limit
-            new_user_len = max(0, len(user) - excess_chars - 100)  # 100 char buffer
-            if new_user_len > 0:
-                logger.warning("Truncating user message by %d chars", excess_chars + 100)
-                user = user[:new_user_len] + "\n[... truncated for context limit ...]"
-                # Recursively check again
-                self._check_context_length(system, user, label)
-            else:
-                raise ValueError(
-                    f"Context size ({total_chars} chars, ~{estimated_tokens} tokens) "
-                    f"exceeds model's context window (num_ctx={self._config.num_ctx}). "
-                    f"System prompt alone is too large."
-                )
+        Return the user message, truncated if the combined system+user context
+        does not fit inside the model's context window (safety margin applied).
 
-    def _call_with_timeout(self, messages: list, timeout: Optional[int] = None) -> str:
+        Raises ValueError only when the system prompt alone is already too large.
+        """
+        cfg = self._mem_cfg
+        budget_tokens = cfg.effective_budget(self._config.get_context_budget())
+        system_tokens = max(1, len(system) // TOKEN_CHAR_FACTOR)
+        available = budget_tokens - system_tokens
+
+        if available <= 0:
+            raise ValueError(
+                f"System prompt alone ({system_tokens} tokens) exceeds the usable "
+                f"context budget ({budget_tokens} tokens, num_ctx={self._config.num_ctx})."
+            )
+
+        estimated = len(user) // TOKEN_CHAR_FACTOR
+        if estimated <= available:
+            return user
+
+        logger.error(
+            "Context too large (~%d tokens, ~%d for the system prompt, budget %d tokens "
+            "with %d reserved for the response) for %s call",
+            estimated, system_tokens, budget_tokens, cfg.reserved_response_tokens, label,
+        )
+        logger.warning("Truncating user message to ~%d tokens", available)
+        return fit_to_budget(user, available)
+
+    def _call_with_timeout(self, messages: list, timeout: int | None = None) -> str:
         timeout = timeout or self._config.timeout
         result: list = []
         error: list = []
@@ -299,6 +271,42 @@ class LLMClient:
         if not result:
             raise RuntimeError("LLM thread completed without producing a result")
         return result[0]
+
+    def merge_summaries(
+        self, blocks: list[CompressedMemory], criteria: Criteria
+    ) -> CompressedMemory:
+        """
+        Merge several compressed blocks into one.
+
+        Without this the compressed-history section grows one block per
+        compression forever — the "compact" context keeps expanding and the
+        oldest insights get pushed out of the window anyway.
+        """
+        block_text = "\n\n".join(b.format_for_llm() for b in blocks)
+        first = min(b.iteration_range[0] for b in blocks)
+        last = max(b.iteration_range[1] for b in blocks)
+        user = (
+            f"CRITERIA:\n{criteria.format_for_llm()}\n\n"
+            f"SUMMARIES TO MERGE (iterations #{first}–#{last}):\n{block_text}\n\n"
+            "Respond with JSON:\n"
+            "  summary      (str)          — one merged summary of the whole range\n"
+            "  key_findings (list of str)  — the most important insights across all blocks\n"
+            "  best_score   (float)        — highest score achieved in this range\n"
+        )
+        raw = self._invoke(
+            _SYSTEM_RESEARCHER, user, label="merge_summaries",
+            validate=_validate_json_keys("summary", "key_findings", "best_score"),
+        )
+        data = _extract_json(raw)
+        findings = data.get("key_findings", [])
+        if not isinstance(findings, list):
+            findings = []
+        return CompressedMemory(
+            iteration_range=(first, last),
+            summary=data.get("summary", ""),
+            key_findings=findings,
+            best_score=max((b.best_score for b in blocks), default=float(data.get("best_score", 0.0))),
+        )
 
     # ---------------------------------------------------------------- #
     #  High-level operations
@@ -459,9 +467,9 @@ class LLMClient:
         self,
         context: str,
         criteria: Criteria,
-        tried_approaches: List[str],
+        tried_approaches: list[str],
         stagnation_count: int = 0,
-    ) -> Tuple[str, str, List[str]]:
+    ) -> tuple[str, str, list[str]]:
         """
         Review experiment history and propose the next concrete improvement.
         Returns (analysis, proposal, avoid).
@@ -508,7 +516,7 @@ class LLMClient:
         current: str,
         context: str,
         criteria: Criteria,
-        avoid: Optional[List[str]] = None,
+        avoid: list[str] | None = None,
     ) -> str:
         """
         Generate a new implementation based on the proposal.
@@ -546,7 +554,7 @@ class LLMClient:
         criteria: Criteria,
         previous_best_score: float,
         previous_best_summary: str,
-    ) -> Tuple[float, str]:
+    ) -> tuple[float, str]:
         """
         Score a result against the criteria.
         Returns (score: float 0.0–1.0, reasoning: str).
@@ -579,7 +587,7 @@ class LLMClient:
         self,
         iterations_text: str,
         criteria: Criteria,
-        iteration_range: Tuple[int, int],
+        iteration_range: tuple[int, int],
     ) -> CompressedMemory:
         """Summarise a batch of iterations that are being evicted from context."""
         user = (

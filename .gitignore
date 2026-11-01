@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+experiments/
+.venv/
+
+# Personal Ollama config — only the .example.json template is committed
+ollama_config.json
